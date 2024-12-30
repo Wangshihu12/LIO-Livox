@@ -1311,16 +1311,31 @@ void LidarFeatureExtractor::detectFeaturePoint3(pcl::PointCloud<PointType>::Ptr 
   }
 }
 
+/**
+ * @brief 从Livox激光雷达消息中提取点云特征，包括角点和平面点特征。
+ *
+ * @param msg 输入的Livox自定义点云消息。
+ * @param laserCloud 输出的完整点云。
+ * @param laserConerFeature 输出的角点特征点云。
+ * @param laserSurfFeature 输出的平面特征点云。
+ * @param Used_Line 使用的激光线束数量。
+ * @param lidar_type 激光雷达的类型，用于不同特征提取规则。
+ */
 void LidarFeatureExtractor::FeatureExtract(const livox_ros_driver::CustomMsgConstPtr &msg,
                                            pcl::PointCloud<PointType>::Ptr &laserCloud,
                                            pcl::PointCloud<PointType>::Ptr &laserConerFeature,
                                            pcl::PointCloud<PointType>::Ptr &laserSurfFeature,
                                            const int Used_Line, const int lidar_type)
 {
+  // 清空输出点云容器
   laserCloud->clear();
   laserConerFeature->clear();
   laserSurfFeature->clear();
+
+  // 预分配内存以提高点云处理效率
   laserCloud->reserve(15000 * N_SCANS);
+
+  // 清空用于存储各激光线束点云和特征的临时容器
   for (auto &ptr : vlines)
   {
     ptr->clear();
@@ -1333,67 +1348,82 @@ void LidarFeatureExtractor::FeatureExtract(const livox_ros_driver::CustomMsgCons
   {
     v.clear();
   }
+
+  // 计算点云的时间跨度
   double timeSpan = ros::Time().fromNSec(msg->points.back().offset_time).toSec();
+
+  // 遍历输入的点云消息并过滤点，根据雷达类型应用不同的规则
   PointType point;
   for (const auto &p : msg->points)
   {
-    int line_num = (int)p.line;
+    int line_num = (int)p.line; // 获取激光线束编号
     if (line_num > Used_Line - 1)
-      continue;
+      continue; // 跳过超过指定线束的点
+
     if (lidar_type == 0 || lidar_type == 1)
     {
-      if (p.x < 0.01)
+      if (p.x < 0.01) // 对类型0和1的激光雷达过滤近距离点
         continue;
     }
     else if (lidar_type == 2)
     {
-      if (std::fabs(p.x) < 0.01)
+      if (std::fabs(p.x) < 0.01) // 对类型2的激光雷达过滤近距离点
         continue;
     }
-    //  if(p.x < 0.01) continue;
+
+    // 将点的坐标和属性赋值到自定义点云类型
     point.x = p.x;
     point.y = p.y;
     point.z = p.z;
-    point.intensity = p.reflectivity;
-    point.normal_x = ros::Time().fromNSec(p.offset_time).toSec() / timeSpan;
-    point.normal_y = _int_as_float(line_num);
-    laserCloud->push_back(point);
+    point.intensity = p.reflectivity;                                        // 反射强度
+    point.normal_x = ros::Time().fromNSec(p.offset_time).toSec() / timeSpan; // 归一化的时间戳
+    point.normal_y = _int_as_float(line_num);                                // 线束编号存储为浮点数
+    laserCloud->push_back(point);                                            // 添加到完整点云
   }
+
+  // 按激光线束编号将点分配到对应的容器
   std::size_t cloud_num = laserCloud->size();
   for (std::size_t i = 0; i < cloud_num; ++i)
   {
-    int line_idx = _float_as_int(laserCloud->points[i].normal_y);
-    laserCloud->points[i].normal_z = _int_as_float(i);
-    vlines[line_idx]->push_back(laserCloud->points[i]);
-    laserCloud->points[i].normal_z = 0;
+    int line_idx = _float_as_int(laserCloud->points[i].normal_y); // 提取线束编号
+    laserCloud->points[i].normal_z = _int_as_float(i);            // 存储点的索引
+    vlines[line_idx]->push_back(laserCloud->points[i]);           // 将点加入对应线束的容器
+    laserCloud->points[i].normal_z = 0;                           // 清除存储的索引
   }
+
+  // 为每条激光线束并行检测特征点（角点和平面点）
   std::thread threads[N_SCANS];
   for (int i = 0; i < N_SCANS; ++i)
   {
-    threads[i] = std::thread(&LidarFeatureExtractor::detectFeaturePoint, this, std::ref(vlines[i]),
-                             std::ref(vcorner[i]), std::ref(vsurf[i]));
+    threads[i] = std::thread(&LidarFeatureExtractor::detectFeaturePoint, this,
+                             std::ref(vlines[i]), std::ref(vcorner[i]), std::ref(vsurf[i]));
   }
+  // 等待所有线程完成特征检测
   for (int i = 0; i < N_SCANS; ++i)
   {
     threads[i].join();
   }
+
+  // 标记特征点的类型（角点或平面点）
   for (int i = 0; i < N_SCANS; ++i)
   {
     for (int j = 0; j < vcorner[i].size(); ++j)
     {
-      laserCloud->points[_float_as_int(vlines[i]->points[vcorner[i][j]].normal_z)].normal_z = 1.0;
+      laserCloud->points[_float_as_int(vlines[i]->points[vcorner[i][j]].normal_z)].normal_z = 1.0; // 角点
     }
     for (int j = 0; j < vsurf[i].size(); ++j)
     {
-      laserCloud->points[_float_as_int(vlines[i]->points[vsurf[i][j]].normal_z)].normal_z = 2.0;
+      laserCloud->points[_float_as_int(vlines[i]->points[vsurf[i][j]].normal_z)].normal_z = 2.0; // 平面点
     }
   }
 
+  // 将标记为角点的点添加到角点特征点云
   for (const auto &p : laserCloud->points)
   {
     if (std::fabs(p.normal_z - 1.0) < 1e-5)
       laserConerFeature->push_back(p);
   }
+  // 将标记为平面点的点添加到平面特征点云
   for (const auto &p : laserCloud->points)
   {
     if (std::fabs(p.normal_z - 2.0) < 1e-5)
