@@ -349,40 +349,72 @@ bool TryMAPInitialization()
 
 /** \brief Mapping main thread
  */
+/**
+ * @brief 主处理函数，用于对 LiDAR 数据和 IMU 数据进行组合处理，并发布处理后的结果。
+ *
+ * @details
+ * 1. 从消息队列中获取最新的 LiDAR 点云数据，转换为 PCL 格式。
+ * 2. 如果已启用 IMU 模式，按照时间区间获取与该帧 LiDAR 数据对应的 IMU 数据，以进行相应的积分或预积分。
+ * 3. 初始化或更新当前 LiDAR 帧的位姿、速度等信息（若已完成初始化，则使用滑窗法进行更新）。
+ * 4. 去除 LiDAR 畸变，并调用外部优化器（Estimation 模块）估计当前 LiDAR 帧位姿。
+ * 5. 根据优化后的 LiDAR 位姿发布对应的位姿（Odometry）和点云（sensor_msgs::PointCloud2）。
+ * 6. 在启用紧耦合 IMU 的模式下，维护一个包含若干 LiDAR 帧的队列（lidarFrameList），并尝试进行联合初始化。
+ *
+ * @note
+ * - 需要配合外部定义的变量和函数使用，如：
+ *   - `_mutexLidarQueue`、`_lidarMsgQueue`：LiDAR 消息队列及其互斥锁。
+ *   - `fetchImuMsgs(time_last, time_curr, vimuMsg)`：获取指定时间段内的 IMU 数据。
+ *   - `lidarFrameList`：存储若干 LiDAR 帧的容器，用于滑窗或初始化。
+ *   - `RemoveLidarDistortion`：去除 LiDAR 点云畸变的函数。
+ *   - `Estimator`、`TryMAPInitialization`、`EstimateLidarPose`：外部的估计和初始化模块。
+ *   - `transformAftMapped`：保存当前优化后的位姿变换矩阵。
+ *   - `exTlb`、`exRlb`、`exPbl` 等外参变量。
+ *   - `GravityVector`：全局重力向量。
+ *   - `pubOdometry`、`pubFullLaserCloud`：发布里程计和点云的话题。
+ */
 void process()
 {
+  // 用于记录上一帧和当前帧 LiDAR 的时间戳
   double time_last_lidar = -1;
   double time_curr_lidar = -1;
+
+  // LiDAR 与 Body 坐标系之间的增量位姿
   Eigen::Matrix3d delta_Rl = Eigen::Matrix3d::Identity();
   Eigen::Vector3d delta_tl = Eigen::Vector3d::Zero();
   Eigen::Matrix3d delta_Rb = Eigen::Matrix3d::Identity();
   Eigen::Vector3d delta_tb = Eigen::Vector3d::Zero();
+
+  // 缓存当前帧对应的 IMU 消息
   std::vector<sensor_msgs::ImuConstPtr> vimuMsg;
+
   while (ros::ok())
   {
-    newfullCloud = false;
+    newfullCloud = false; // 标记是否有新 LiDAR 数据
     laserCloudFullRes.reset(new pcl::PointCloud<PointType>());
+
+    // 1. 从消息队列中获取最新的 LiDAR 数据
     std::unique_lock<std::mutex> lock_lidar(_mutexLidarQueue);
     if (!_lidarMsgQueue.empty())
     {
-      // get new lidar msg
       time_curr_lidar = _lidarMsgQueue.front()->header.stamp.toSec();
       pcl::fromROSMsg(*_lidarMsgQueue.front(), *laserCloudFullRes);
       _lidarMsgQueue.pop();
-      newfullCloud = true;
+      newfullCloud = true; // 获取成功
     }
     lock_lidar.unlock();
 
+    // 若成功获取 LiDAR 数据，则进行后续处理
     if (newfullCloud)
     {
-
+      // 2. 生成调试信息（IMU 模式下，用于查看过程）
       nav_msgs::Odometry debugInfo;
       debugInfo.pose.pose.position.x = 0;
       debugInfo.pose.pose.position.y = 0;
       debugInfo.pose.pose.position.z = 0;
+
+      // 如果 IMU 模式启用，并且不是第一帧，则获取与 [time_last_lidar, time_curr_lidar] 对应的 IMU 数据
       if (IMU_Mode > 0 && time_last_lidar > 0)
       {
-        // get IMU msg int the Specified time interval
         vimuMsg.clear();
         int countFail = 0;
         while (!fetchImuMsgs(time_last_lidar, time_curr_lidar, vimuMsg))
@@ -395,23 +427,28 @@ void process()
           std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
       }
-      // this lidar frame init
+
+      // 3. 构造当前 LidarFrame，并填充基础信息
       Estimator::LidarFrame lidarFrame;
       lidarFrame.laserCloud = laserCloudFullRes;
       lidarFrame.timeStamp = time_curr_lidar;
 
       boost::shared_ptr<std::list<Estimator::LidarFrame>> lidar_list;
+
+      // 若获取到了 IMU 消息
       if (!vimuMsg.empty())
       {
+        // (1) 若尚未完成激光-IMU 初始对准，则只进行陀螺积分，获得相对旋转
         if (!LidarIMUInited)
         {
-          // if get IMU msg successfully, use gyro integration to update delta_Rl
           lidarFrame.imuIntegrator.PushIMUMsg(vimuMsg);
           lidarFrame.imuIntegrator.GyroIntegration(time_last_lidar);
+
           delta_Rb = lidarFrame.imuIntegrator.GetDeltaQ().toRotationMatrix();
+          // 将 body 坐标系下的旋转变换到 LiDAR 坐标系
           delta_Rl = exTlb.topLeftCorner(3, 3) * delta_Rb * exTlb.topLeftCorner(3, 3).transpose();
 
-          // predict current lidar pose
+          // 预测当前 LiDAR 的位置，简单累加
           lidarFrame.P = transformAftMapped.topLeftCorner(3, 3) * delta_tb + transformAftMapped.topRightCorner(3, 1);
           Eigen::Matrix3d m3d = transformAftMapped.topLeftCorner(3, 3) * delta_Rb;
           lidarFrame.Q = m3d;
@@ -421,25 +458,29 @@ void process()
         }
         else
         {
-          // if get IMU msg successfully, use pre-integration to update delta lidar pose
+          // (2) 若已经完成激光-IMU 初始对准，则对该帧进行 IMU 预积分，并更新位姿
           lidarFrame.imuIntegrator.PushIMUMsg(vimuMsg);
           lidarFrame.imuIntegrator.PreIntegration(lidarFrameList->back().timeStamp, lidarFrameList->back().bg, lidarFrameList->back().ba);
 
+          // 上一帧的状态
           const Eigen::Vector3d &Pwbpre = lidarFrameList->back().P;
           const Eigen::Quaterniond &Qwbpre = lidarFrameList->back().Q;
           const Eigen::Vector3d &Vwbpre = lidarFrameList->back().V;
 
+          // 预积分量
           const Eigen::Quaterniond &dQ = lidarFrame.imuIntegrator.GetDeltaQ();
           const Eigen::Vector3d &dP = lidarFrame.imuIntegrator.GetDeltaP();
           const Eigen::Vector3d &dV = lidarFrame.imuIntegrator.GetDeltaV();
           double dt = lidarFrame.imuIntegrator.GetDeltaTime();
 
+          // 预测当前帧在世界坐标系下的位姿
           lidarFrame.Q = Qwbpre * dQ;
-          lidarFrame.P = Pwbpre + Vwbpre * dt + 0.5 * GravityVector * dt * dt + Qwbpre * (dP);
-          lidarFrame.V = Vwbpre + GravityVector * dt + Qwbpre * (dV);
+          lidarFrame.P = Pwbpre + Vwbpre * dt + 0.5 * GravityVector * dt * dt + Qwbpre * dP;
+          lidarFrame.V = Vwbpre + GravityVector * dt + Qwbpre * dV;
           lidarFrame.bg = lidarFrameList->back().bg;
           lidarFrame.ba = lidarFrameList->back().ba;
 
+          // 计算在 LiDAR 坐标系下的相对位姿变化
           Eigen::Quaterniond Qwlpre = Qwbpre * Eigen::Quaterniond(exRbl);
           Eigen::Vector3d Pwlpre = Qwbpre * exPbl + Pwbpre;
 
@@ -458,11 +499,15 @@ void process()
       }
       else
       {
+        // 若未获取IMU消息
         if (LidarIMUInited)
+        {
+          // 一旦完成初始化后，需要IMU数据来继续
           break;
+        }
         else
         {
-          // predict current lidar pose
+          // 简单地沿用上一帧的结果进行预测
           lidarFrame.P = transformAftMapped.topLeftCorner(3, 3) * delta_tb + transformAftMapped.topRightCorner(3, 1);
           Eigen::Matrix3d m3d = transformAftMapped.topLeftCorner(3, 3) * delta_Rb;
           lidarFrame.Q = m3d;
@@ -472,33 +517,33 @@ void process()
         }
       }
 
-      // remove lidar distortion
+      // 4. 去除 LiDAR 畸变
       RemoveLidarDistortion(laserCloudFullRes, delta_Rl, delta_tl);
 
-      // optimize current lidar pose with IMU
+      // 5. 调用外部 Estimator 模块对当前 LiDAR 帧进行优化
       estimator->EstimateLidarPose(*lidar_list, exTlb, GravityVector, debugInfo);
 
-      pcl::PointCloud<PointType>::Ptr laserCloudCornerMap(new pcl::PointCloud<PointType>());
-      pcl::PointCloud<PointType>::Ptr laserCloudSurfMap(new pcl::PointCloud<PointType>());
-
+      // 根据优化后的位姿更新变换矩阵
       Eigen::Matrix4d transformTobeMapped = Eigen::Matrix4d::Identity();
       transformTobeMapped.topLeftCorner(3, 3) = lidar_list->front().Q * exRbl;
       transformTobeMapped.topRightCorner(3, 1) = lidar_list->front().Q * exPbl + lidar_list->front().P;
 
-      // update delta transformation
+      // 更新相对位姿增量
       delta_Rb = transformAftMapped.topLeftCorner(3, 3).transpose() * lidar_list->front().Q.toRotationMatrix();
       delta_tb = transformAftMapped.topLeftCorner(3, 3).transpose() * (lidar_list->front().P - transformAftMapped.topRightCorner(3, 1));
+
       Eigen::Matrix3d Rwlpre = transformAftMapped.topLeftCorner(3, 3) * exRbl;
       Eigen::Vector3d Pwlpre = transformAftMapped.topLeftCorner(3, 3) * exPbl + transformAftMapped.topRightCorner(3, 1);
       delta_Rl = Rwlpre.transpose() * transformTobeMapped.topLeftCorner(3, 3);
       delta_tl = Rwlpre.transpose() * (transformTobeMapped.topRightCorner(3, 1) - Pwlpre);
+
       transformAftMapped.topLeftCorner(3, 3) = lidar_list->front().Q.toRotationMatrix();
       transformAftMapped.topRightCorner(3, 1) = lidar_list->front().P;
 
-      // publish odometry rostopic
+      // 6. 发布优化后的里程计消息
       pubOdometry(transformTobeMapped, lidar_list->front().timeStamp);
 
-      // publish lidar points
+      // 7. 将当前帧的点云进行位姿变换后发布
       int laserCloudFullResNum = lidar_list->front().laserCloud->points.size();
       pcl::PointCloud<PointType>::Ptr laserCloudAfterEstimate(new pcl::PointCloud<PointType>());
       laserCloudAfterEstimate->reserve(laserCloudFullResNum);
@@ -514,19 +559,19 @@ void process()
       laserCloudMsg.header.stamp.fromSec(lidar_list->front().timeStamp);
       pubFullLaserCloud.publish(laserCloudMsg);
 
-      // if tightly coupled IMU message, start IMU initialization
+      // 8. 如果启用紧耦合 IMU 模式，维护 LiDAR 帧队列，并尝试进行初始化
       if (IMU_Mode > 1 && !LidarIMUInited)
       {
-        // update lidar frame pose
+        // 更新当前帧 LiDAR 的世界位姿
         lidarFrame.P = transformTobeMapped.topRightCorner(3, 1);
         Eigen::Matrix3d m3d = transformTobeMapped.topLeftCorner(3, 3);
         lidarFrame.Q = m3d;
 
-        // static int pushCount = 0;
+        // 静态计数 pushCount 用于控制将 LiDAR 帧推入滑窗的频率
         if (pushCount == 0)
         {
           lidarFrameList->push_back(lidarFrame);
-          lidarFrameList->back().imuIntegrator.Reset();
+          lidarFrameList->back().imuIntegrator.Reset(); // 重置该帧的 IMU 积分器
           if (lidarFrameList->size() > WINDOWSIZE)
             lidarFrameList->pop_front();
         }
@@ -539,6 +584,8 @@ void process()
           lidarFrameList->back().Q = lidarFrame.Q;
         }
         pushCount++;
+
+        // 当积累的帧数达到一定数量后，进行一次联合初始化或更新
         if (pushCount >= 3)
         {
           pushCount = 0;
@@ -549,24 +596,28 @@ void process()
             iterRight->imuIntegrator.PreIntegration(iterLeft->timeStamp, iterLeft->bg, iterLeft->ba);
           }
 
+          // 记录初始化开始时间
           if (lidarFrameList->size() == int(WINDOWSIZE / 1.5))
           {
             startTime = lidarFrameList->back().timeStamp;
           }
 
+          // 如果帧数达到窗口大小，并且最早的帧时间大于 startTime，进行 MAP 初始化
           if (!LidarIMUInited && lidarFrameList->size() == WINDOWSIZE && lidarFrameList->front().timeStamp >= startTime)
           {
-            std::cout << "**************Start MAP Initialization!!!******************" << std::endl;
+            ROS_INFO("**************Start MAP Initialization!!!******************");
             if (TryMAPInitialization())
             {
               LidarIMUInited = true;
               pushCount = 0;
               startTime = 0;
             }
-            std::cout << "**************Finish MAP Initialization!!!******************" << std::endl;
+            ROS_INFO("**************Finish MAP Initialization!!!******************");
           }
         }
       }
+
+      // 记录当前帧时间戳，供下一次使用
       time_last_lidar = time_curr_lidar;
     }
   }
