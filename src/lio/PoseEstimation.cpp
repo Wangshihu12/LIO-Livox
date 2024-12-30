@@ -183,73 +183,64 @@ void RemoveLidarDistortion(pcl::PointCloud<PointType>::Ptr &cloud,
   }
 }
 
+/**
+ * @brief 尝试通过多传感器联合优化的方式进行初始地图与参数的初始化
+ *
+ * @details
+ * 本函数使用IMU和LiDAR传感器的数据，结合Ceres优化框架，通过残差构建并优化初始重力方向、速度、偏置和其他相关参数。
+ * 包括以下主要步骤：
+ * 1. 使用IMU数据计算初始的重力方向。
+ * 2. 构建先验约束，优化重力方向、速度、偏置等参数。
+ * 3. 使用IMU积分的结果与位姿变化添加残差约束。
+ * 4. 检查优化结果的有效性并更新所有关键帧的状态。
+ *
+ * @return bool 返回初始化是否成功
+ * - true：初始化成功
+ * - false：初始化失败
+ */
 bool TryMAPInitialization()
 {
-
+  // **1. 利用IMU数据估算初始重力方向**
   Eigen::Vector3d average_acc = -lidarFrameList->begin()->imuIntegrator.GetAverageAcc();
-  double info_g = std::fabs(9.805 - average_acc.norm());
-  average_acc = average_acc * 9.805 / average_acc.norm();
+  double info_g = std::fabs(9.805 - average_acc.norm());  // 计算加速度差值
+  average_acc = average_acc * 9.805 / average_acc.norm(); // 归一化重力加速度
 
-  // calculate the initial gravity direction
-  double para_quat[4];
-  para_quat[0] = 1;
-  para_quat[1] = 0;
-  para_quat[2] = 0;
-  para_quat[3] = 0;
-
-  ceres::LocalParameterization *quatParam = new ceres::QuaternionParameterization();
+  // 初始化重力方向参数
+  double para_quat[4] = {1, 0, 0, 0};                                                // 四元数初始化为单位四元数
+  ceres::LocalParameterization *quatParam = new ceres::QuaternionParameterization(); // 定义四元数的局部参数化
   ceres::Problem problem_quat;
-
   problem_quat.AddParameterBlock(para_quat, 4, quatParam);
-
-  problem_quat.AddResidualBlock(Cost_Initial_G::Create(average_acc),
-                                nullptr,
-                                para_quat);
+  problem_quat.AddResidualBlock(Cost_Initial_G::Create(average_acc), nullptr, para_quat);
 
   ceres::Solver::Options options_quat;
   ceres::Solver::Summary summary_quat;
   ceres::Solve(options_quat, &problem_quat, &summary_quat);
 
-  Eigen::Quaterniond q_wg(para_quat[0], para_quat[1], para_quat[2], para_quat[3]);
+  Eigen::Quaterniond q_wg(para_quat[0], para_quat[1], para_quat[2], para_quat[3]); // 重力方向
 
-  // build prior factor of LIO initialization
+  // **2. 构造先验因子**
   Eigen::Vector3d prior_r = Eigen::Vector3d::Zero();
   Eigen::Vector3d prior_ba = Eigen::Vector3d::Zero();
   Eigen::Vector3d prior_bg = Eigen::Vector3d::Zero();
-  std::vector<Eigen::Vector3d> prior_v;
-  int v_size = lidarFrameList->size();
-  for (int i = 0; i < v_size; i++)
-  {
-    prior_v.push_back(Eigen::Vector3d::Zero());
-  }
+  std::vector<Eigen::Vector3d> prior_v(lidarFrameList->size(), Eigen::Vector3d::Zero());
   Sophus::SO3d SO3_R_wg(q_wg.toRotationMatrix());
-  prior_r = SO3_R_wg.log();
+  prior_r = SO3_R_wg.log(); // 使用SO3的log形式保存重力方向
 
-  for (int i = 1; i < v_size; i++)
+  // **3. 初始化速度**
+  for (size_t i = 1; i < lidarFrameList->size(); i++)
   {
     auto iter = lidarFrameList->begin();
     auto iter_next = lidarFrameList->begin();
     std::advance(iter, i - 1);
     std::advance(iter_next, i);
-
-    Eigen::Vector3d velo_imu = (iter_next->P - iter->P + iter_next->Q * exPlb - iter->Q * exPlb) / (iter_next->timeStamp - iter->timeStamp);
-    prior_v[i] = velo_imu;
+    prior_v[i] = (iter_next->P - iter->P + iter_next->Q * exPlb - iter->Q * exPlb) / (iter_next->timeStamp - iter->timeStamp);
   }
   prior_v[0] = prior_v[1];
 
-  double para_v[v_size][3];
-  double para_r[3];
-  double para_ba[3];
-  double para_bg[3];
-
-  for (int i = 0; i < 3; i++)
-  {
-    para_r[i] = 0;
-    para_ba[i] = 0;
-    para_bg[i] = 0;
-  }
-
-  for (int i = 0; i < v_size; i++)
+  // **4. 构建优化问题**
+  double para_v[lidarFrameList->size()][3];
+  double para_r[3] = {0}, para_ba[3] = {0}, para_bg[3] = {0};
+  for (size_t i = 0; i < lidarFrameList->size(); i++)
   {
     for (int j = 0; j < 3; j++)
     {
@@ -262,64 +253,42 @@ bool TryMAPInitialization()
   Eigen::Matrix<double, 3, 3> sqrt_information_bg = 4000.0 * Eigen::Matrix<double, 3, 3>::Identity();
   Eigen::Matrix<double, 3, 3> sqrt_information_v = 4000.0 * Eigen::Matrix<double, 3, 3>::Identity();
 
-  ceres::Problem::Options problem_options;
-  ceres::Problem problem(problem_options);
+  ceres::Problem problem;
   problem.AddParameterBlock(para_r, 3);
   problem.AddParameterBlock(para_ba, 3);
   problem.AddParameterBlock(para_bg, 3);
-  for (int i = 0; i < v_size; i++)
+  for (size_t i = 0; i < lidarFrameList->size(); i++)
   {
     problem.AddParameterBlock(para_v[i], 3);
   }
 
-  // add CostFunction
-  problem.AddResidualBlock(Cost_Initialization_Prior_R::Create(prior_r, sqrt_information_r),
-                           nullptr,
-                           para_r);
-
-  problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_ba, sqrt_information_ba),
-                           nullptr,
-                           para_ba);
-  problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_bg, sqrt_information_bg),
-                           nullptr,
-                           para_bg);
-
-  for (int i = 0; i < v_size; i++)
+  // 添加先验残差
+  problem.AddResidualBlock(Cost_Initialization_Prior_R::Create(prior_r, sqrt_information_r), nullptr, para_r);
+  problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_ba, sqrt_information_ba), nullptr, para_ba);
+  problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_bg, sqrt_information_bg), nullptr, para_bg);
+  for (size_t i = 0; i < lidarFrameList->size(); i++)
   {
-    problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_v[i], sqrt_information_v),
-                             nullptr,
-                             para_v[i]);
+    problem.AddResidualBlock(Cost_Initialization_Prior_bv::Create(prior_v[i], sqrt_information_v), nullptr, para_v[i]);
   }
 
-  for (int i = 1; i < v_size; i++)
+  // 添加IMU残差
+  for (size_t i = 1; i < lidarFrameList->size(); i++)
   {
     auto iter = lidarFrameList->begin();
     auto iter_next = lidarFrameList->begin();
     std::advance(iter, i - 1);
     std::advance(iter_next, i);
-
-    Eigen::Vector3d pi = iter->P + iter->Q * exPlb;
-    Sophus::SO3d SO3_Ri(iter->Q * exRlb);
-    Eigen::Vector3d ri = SO3_Ri.log();
-    Eigen::Vector3d pj = iter_next->P + iter_next->Q * exPlb;
-    Sophus::SO3d SO3_Rj(iter_next->Q * exRlb);
-    Eigen::Vector3d rj = SO3_Rj.log();
-
-    problem.AddResidualBlock(Cost_Initialization_IMU::Create(iter_next->imuIntegrator,
-                                                             ri,
-                                                             rj,
-                                                             pj - pi,
-                                                             Eigen::LLT<Eigen::Matrix<double, 9, 9>>(iter_next->imuIntegrator.GetCovariance().block<9, 9>(0, 0).inverse())
-                                                                 .matrixL()
-                                                                 .transpose()),
+    problem.AddResidualBlock(Cost_Initialization_IMU::Create(
+                                 iter_next->imuIntegrator,
+                                 Sophus::SO3d(iter->Q * exRlb).log(),
+                                 Sophus::SO3d(iter_next->Q * exRlb).log(),
+                                 iter_next->P + iter_next->Q * exPlb - (iter->P + iter->Q * exPlb),
+                                 Eigen::LLT<Eigen::Matrix<double, 9, 9>>(iter_next->imuIntegrator.GetCovariance().block<9, 9>(0, 0).inverse()).matrixL().transpose()),
                              nullptr,
-                             para_r,
-                             para_v[i - 1],
-                             para_v[i],
-                             para_ba,
-                             para_bg);
+                             para_r, para_v[i - 1], para_v[i], para_ba, para_bg);
   }
 
+  // 优化求解
   ceres::Solver::Options options;
   options.minimizer_progress_to_stdout = false;
   options.linear_solver_type = ceres::DENSE_QR;
@@ -327,9 +296,9 @@ bool TryMAPInitialization()
   ceres::Solver::Summary summary;
   ceres::Solve(options, &problem, &summary);
 
+  // **5. 检查优化结果并更新状态**
   Eigen::Vector3d r_wg(para_r[0], para_r[1], para_r[2]);
   GravityVector = Sophus::SO3d::exp(r_wg) * Eigen::Vector3d(0, 0, -9.805);
-
   Eigen::Vector3d ba_vec(para_ba[0], para_ba[1], para_ba[2]);
   Eigen::Vector3d bg_vec(para_bg[0], para_bg[1], para_bg[2]);
 
@@ -339,7 +308,7 @@ bool TryMAPInitialization()
     return false;
   }
 
-  for (int i = 0; i < v_size; i++)
+  for (size_t i = 0; i < lidarFrameList->size(); i++)
   {
     auto iter = lidarFrameList->begin();
     std::advance(iter, i);
@@ -349,13 +318,13 @@ bool TryMAPInitialization()
     if ((bv_vec - prior_v[i]).norm() > 2.0)
     {
       ROS_WARN("Too Large Velocity! Initialization Failed!");
-      std::cout << "delta v norm: " << (bv_vec - prior_v[i]).norm() << std::endl;
       return false;
     }
     iter->V = bv_vec;
   }
 
-  for (size_t i = 0; i < v_size - 1; i++)
+  // 更新IMU预积分
+  for (size_t i = 0; i < lidarFrameList->size() - 1; i++)
   {
     auto laser_trans_i = lidarFrameList->begin();
     auto laser_trans_j = lidarFrameList->begin();
@@ -364,7 +333,7 @@ bool TryMAPInitialization()
     laser_trans_j->imuIntegrator.PreIntegration(laser_trans_i->timeStamp, laser_trans_i->bg, laser_trans_i->ba);
   }
 
-  // //if IMU success initialized
+  // 窗口管理
   WINDOWSIZE = Estimator::SLIDEWINDOWSIZE;
   while (lidarFrameList->size() > WINDOWSIZE)
   {
@@ -374,8 +343,6 @@ bool TryMAPInitialization()
   Eigen::Quaterniond Qwl = lidarFrameList->back().Q;
   lidarFrameList->back().P = Pwl + Qwl * exPlb;
   lidarFrameList->back().Q = Qwl * exRlb;
-
-  // std::cout << "\n=============================\n| Initialization Successful |"<<"\n=============================\n" << std::endl;
 
   return true;
 }
