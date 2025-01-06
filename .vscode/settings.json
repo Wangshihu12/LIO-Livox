@@ -70,5 +70,13 @@
         "valarray": "cpp",
         "variant": "cpp",
         "bit": "cpp"
-    }
+    },
+    "python.autoComplete.extraPaths": [
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/path/to/SuperGluePretrainedNetwork"
+    ],
+    "python.analysis.extraPaths": [
+        "/opt/ros/noetic/lib/python3/dist-packages",
+        "/path/to/SuperGluePretrainedNetwork"
+    ]
 }
