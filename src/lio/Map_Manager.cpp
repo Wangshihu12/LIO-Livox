@@ -63,21 +63,37 @@ void MAP_MANAGER::featureAssociateToMap(const pcl::PointCloud<PointType>::Ptr &l
                                         const pcl::PointCloud<PointType>::Ptr &laserCloudNonFeatureToMap,
                                         const Eigen::Matrix4d &transformTobeMapped)
 {
+  // 这个函数的作用是将激光雷达坐标系下的特征点转换到地图坐标系下
+  // 输入参数:
+  // laserCloudCorner - 激光雷达坐标系下的角点特征
+  // laserCloudSurf - 激光雷达坐标系下的平面特征点
+  // laserCloudNonFeature - 激光雷达坐标系下的非特征点
+  // laserCloudCornerToMap - 转换到地图坐标系的角点特征(输出)
+  // laserCloudSurfToMap - 转换到地图坐标系的平面特征点(输出)
+  // laserCloudNonFeatureToMap - 转换到地图坐标系的非特征点(输出)
+  // transformTobeMapped - 激光雷达到地图的变换矩阵
 
+  // 获取各类特征点的数量
   int laserCloudCornerNum = laserCloudCorner->points.size();
   int laserCloudSurfNum = laserCloudSurf->points.size();
   int laserCloudNonFeatureNum = laserCloudNonFeature->points.size();
   PointType pointSel1, pointSel2, pointSel3;
+
+  // 转换角点特征
   for (int i = 0; i < laserCloudCornerNum; i++)
   {
     pointAssociateToMap(&laserCloudCorner->points[i], &pointSel1, transformTobeMapped);
     laserCloudCornerToMap->push_back(pointSel1);
   }
+
+  // 转换平面特征点
   for (int i = 0; i < laserCloudSurfNum; i++)
   {
     pointAssociateToMap(&laserCloudSurf->points[i], &pointSel2, transformTobeMapped);
     laserCloudSurfToMap->push_back(pointSel2);
   }
+
+  // 转换非特征点
   for (int i = 0; i < laserCloudNonFeatureNum; i++)
   {
     pointAssociateToMap(&laserCloudNonFeature->points[i], &pointSel3, transformTobeMapped);
